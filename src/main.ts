@@ -35,6 +35,7 @@ import {
     last,
     mergeMap,
     from,
+    EMPTY,
 } from "rxjs";
 import { fromFetch } from "rxjs/fetch";
 
@@ -549,10 +550,41 @@ export const state$ = (
             return { kind: "flap", vy } as const;
         }),
     );
+    // Pause key
+    const pauseKey$ = fromEvent<KeyboardEvent>(window, "keydown").pipe(
+        filter(e => e.code === "KeyP" && !e.repeat),
+    );
 
+    // Event that flips paused in the reducer (so UI can show "Paused")
+    const pauseToggleEv$ = pauseKey$.pipe(
+        map((): EvTogglePause => ({ kind: "pauseToggle" })),
+    );
+
+    // Boolean pause state stream (outside the reducer) to gate ticks/spawns
+    const paused$ = pauseKey$.pipe(
+        scan(paused => !paused, false),
+        startWith(false),
+    );
     /** Determines the rate of time steps */
-    const tick$ = interval(Constants.TICK_RATE_MS).pipe(
-        map((): EvTick => ({ kind: "tick", dt: Constants.TICK_RATE_MS })),
+    const tick$: Observable<EvTick> = paused$.pipe(
+        switchMap(paused =>
+            paused
+                ? EMPTY
+                : interval(Constants.TICK_RATE_MS).pipe(
+                      map(
+                          (): EvTick => ({
+                              kind: "tick",
+                              dt: Constants.TICK_RATE_MS,
+                          }),
+                      ),
+                  ),
+        ),
+    );
+
+    const gameTime$ = tick$.pipe(
+        // accumulate simulated time in ms
+        scan((t, ev) => t + ev.dt, 0),
+        startWith(0),
     );
 
     // Parse CSV & schedule pipe spawns
