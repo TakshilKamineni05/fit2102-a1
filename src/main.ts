@@ -589,12 +589,21 @@ export const state$ = (
 
     // Parse CSV & schedule pipe spawns
     const specs = parseCsv(csvContents);
-    const spawn$ = merge(
-        ...specs.map((spec, id) =>
-            timer(spec.timeMs).pipe(
-                map((): EvSpawn => ({ kind: "spawn", id, spec })),
-            ),
+    // specs already sorted by timeMs (they are from the CSV order)
+    const spawn$: Observable<EvSpawn> = gameTime$.pipe(
+        scan(
+            (acc, t) => {
+                const out: EvSpawn[] = [];
+                let i = acc.nextIdx;
+                while (i < specs.length && specs[i].timeMs <= t) {
+                    out.push({ kind: "spawn", id: i, spec: specs[i] });
+                    i++;
+                }
+                return { nextIdx: i, out };
+            },
+            { nextIdx: 0, out: [] as EvSpawn[] },
         ),
+        mergeMap(s => from(s.out)), // flatten zero-or-more spawns per tick
     );
 
     const init: State = {
