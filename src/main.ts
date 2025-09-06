@@ -130,6 +130,8 @@ type State = Readonly<{
     spawned: number;
     totalToSpawn: number;
     iFramesMs: number; // NEW: remaining hit-cooldown ms (invulnerability window)
+    ghostNow: readonly GhostSample[];
+    ghostPrev?: readonly GhostSample[];
 }>;
 
 const initialState: State = {
@@ -142,6 +144,8 @@ const initialState: State = {
     spawned: 0,
     totalToSpawn: 0,
     iFramesMs: 0,
+    ghostNow: [],
+    ghostPrev: undefined,
 };
 
 /** Events */
@@ -352,6 +356,8 @@ const step = (s: State, e: Event): State => {
 
         case "tick": {
             const dt = e.dt / 1000;
+            // Record ghost sample for this run (pure append)
+            const ghostNow = [...s.ghostNow, { t: s.t + e.dt, y: yClamped }];
 
             // Bird physics
             const vyNext = s.bird.vy + Physics.GRAVITY * dt;
@@ -434,6 +440,7 @@ const step = (s: State, e: Event): State => {
                 lives,
                 gameEnd,
                 iFramesMs,
+                ghostNow,
             };
         }
     }
@@ -500,7 +507,12 @@ export const state$ = (csvContents: string): Observable<State> => {
         ),
     );
 
-    const init: State = { ...initialState, totalToSpawn: specs.length };
+    const init: State = {
+        ...initialState,
+        totalToSpawn: specs.length,
+        ghostNow: [],
+        ghostPrev: ghostPrev ?? undefined,
+    };
 
     // Reduce all events into State and complete on game end
     const events$: Observable<Event> = merge(tick$, flap$, spawn$);
