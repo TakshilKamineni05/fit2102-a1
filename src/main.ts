@@ -60,7 +60,7 @@ const Constants = {
 } as const;
 
 const LivesCfg = {
-    START: 3000, // lives at the beginning
+    START: 3, // lives at the beginning
     HIT_COOLDOWN_MS: 500, // grace period after a hit so we don't lose multiple lives at once
     BOUNCE_VY: -350, // upward bounce after a hit (feels responsive)
 } as const;
@@ -129,9 +129,10 @@ type State = Readonly<{
     gameEnd: boolean; // kept from your original type
     spawned: number;
     totalToSpawn: number;
-    iFramesMs: number; // NEW: remaining hit-cooldown ms (invulnerability window)
-    ghostNow: readonly GhostSample[];
-    ghostPrev?: readonly GhostSample[];
+    iFramesMs: number; // remaining hit-cooldown ms (invulnerability window)
+
+    ghostNow: readonly GhostSample[]; // this run’s recording
+    ghostPrev?: readonly GhostSample[]; // previous run’s recording (for playback)
 }>;
 
 const initialState: State = {
@@ -144,6 +145,7 @@ const initialState: State = {
     spawned: 0,
     totalToSpawn: 0,
     iFramesMs: 0,
+
     ghostNow: [],
     ghostPrev: undefined,
 };
@@ -156,13 +158,11 @@ type Event = EvTick | EvFlap | EvSpawn;
 
 /**
  * Updates the state by proceeding with one time step.
- *
- * (Your original tick function is kept below, unused by the new reducer,
- * to honour the “don’t remove originals” instruction.)
+ * (Original placeholder kept for marking)
  */
 const tick = (s: State) => s;
 
-/** Rendering (side effects) — your helpers kept intact */
+/** Rendering (side effects) — helpers kept intact */
 
 const bringToForeground = (elem: SVGElement): void => {
     elem.parentNode?.appendChild(elem);
@@ -218,6 +218,22 @@ const render = (): ((s: State) => void) => {
         svg.appendChild(birdImg);
     }
 
+    // Create ghost once
+    let ghostImg = document.querySelector("#ghost") as SVGImageElement | null;
+    if (!ghostImg) {
+        ghostImg = createSvgElement(svg.namespaceURI, "image", {
+            id: "ghost",
+            href: "assets/birb.png",
+            opacity: "0.4",
+            x: `${Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2}`,
+            y: `${Viewport.CANVAS_HEIGHT / 2 - Birb.HEIGHT / 2}`,
+            width: `${Birb.WIDTH}`,
+            height: `${Birb.HEIGHT}`,
+            visibility: "hidden",
+        }) as SVGImageElement;
+        svg.appendChild(ghostImg);
+    }
+
     // Maintain pipe elements keyed by ID
     const pipeEls = new Map<
         number,
@@ -231,6 +247,16 @@ const render = (): ((s: State) => void) => {
 
         // Update bird Y
         birdImg!.setAttribute("y", String(s.bird.y - Birb.HEIGHT / 2));
+
+        // Ghost playback: show previous run, synced to s.t
+        if (s.ghostPrev && s.ghostPrev.length) {
+            const idx = binarySearchLastLE(s.ghostPrev, s.t, smp => smp.t);
+            const gy = idx >= 0 ? s.ghostPrev[idx].y : s.ghostPrev[0].y;
+            ghostImg!.setAttribute("y", String(gy - Birb.HEIGHT / 2));
+            ghostImg!.setAttribute("visibility", "visible");
+        } else {
+            ghostImg!.setAttribute("visibility", "hidden");
+        }
 
         // Ensure/render each pipe
         const seen = new Set<number>();
@@ -335,7 +361,28 @@ const collides = (bird: Bird, p: Pipe): boolean => {
     );
 };
 
-/** ───────────── Reducer (now with lives logic) ───────────── */
+function binarySearchLastLE<T>(
+    arr: readonly T[],
+    t: number,
+    get: (x: T) => number,
+): number {
+    let lo = 0,
+        hi = arr.length - 1,
+        ans = -1;
+    while (lo <= hi) {
+        const mid = (lo + hi) >> 1,
+            v = get(arr[mid]);
+        if (v <= t) {
+            ans = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return ans;
+}
+
+/** ───────────── Reducer (with lives + ghost recording) ───────────── */
 
 const step = (s: State, e: Event): State => {
     switch (e.kind) {
@@ -356,8 +403,6 @@ const step = (s: State, e: Event): State => {
 
         case "tick": {
             const dt = e.dt / 1000;
-            // Record ghost sample for this run (pure append)
-            const ghostNow = [...s.ghostNow, { t: s.t + e.dt, y: yClamped }];
 
             // Bird physics
             const vyNext = s.bird.vy + Physics.GRAVITY * dt;
@@ -365,6 +410,9 @@ const step = (s: State, e: Event): State => {
             const minY = Birb.HEIGHT / 2;
             const maxY = Viewport.CANVAS_HEIGHT - Birb.HEIGHT / 2;
             const yClamped = clamp(yRaw, minY, maxY);
+
+            // Record ghost sample for this run (pure append)
+            const ghostNow = [...s.ghostNow, { t: s.t + e.dt, y: yClamped }];
 
             // Move pipes & cull offscreen
             const moved = s.pipes.map(p => ({
@@ -466,16 +514,20 @@ const parseCsv = (text: string): readonly PipeSpec[] => {
 };
 
 /** ───────────── state$ — build one run from CSV ───────────── */
-export const state$ = (csvContents: string): Observable<State> => {
-    // Key stream: Space for flap (prevent page scroll)
+export const state$ = (
+    csvContents: string,
+    ghostPrev?: readonly GhostSample[],
+): Observable<State> => {
+    // Key stream: Space for flap (prevent page scroll, ignore auto-repeat)
     const key$ = fromEvent<KeyboardEvent>(window, "keydown");
     const fromKey = (keyCode: Key) =>
         key$.pipe(
             filter(
                 e =>
-                    e.code === keyCode ||
-                    (keyCode === "Space" &&
-                        (e.key === " " || e.code === "Space")),
+                    !e.repeat &&
+                    (e.code === keyCode ||
+                        (keyCode === "Space" &&
+                            (e.key === " " || e.code === "Space"))),
             ),
             tap(e => {
                 if (e.code === "Space" || e.key === " ") e.preventDefault();
@@ -559,17 +611,33 @@ if (typeof window !== "undefined") {
         filter(e => e.code === "KeyR"),
     );
 
-    // Start on first click, then every time 'R' is pressed we switch to a fresh run.
+    // Build a renderer once; use it inside the run chain
+    const renderer = render();
+
+    // After click: compose a pure chain of runs.
+    // Each run emits States (rendered via tap(renderer)), then completes on gameEnd;
+    // we take its final State, extract ghostNow, and feed it as ghostPrev to the next run.
     csv$.pipe(
         switchMap(contents =>
             click$.pipe(
                 switchMap(() =>
                     restart$.pipe(
-                        startWith(null), // run immediately after the first click
-                        switchMap(() => state$(contents)), // NEW run each time (fresh timers, lives reset)
+                        startWith(null),
+                        switchScan(
+                            (
+                                prevTrace: readonly GhostSample[] | null,
+                                _ev: KeyboardEvent | null,
+                            ) =>
+                                state$(contents, prevTrace ?? undefined).pipe(
+                                    tap(renderer),
+                                    last(),
+                                    map(s => s.ghostNow),
+                                ),
+                            null as readonly GhostSample[] | null,
+                        ),
                     ),
                 ),
             ),
         ),
-    ).subscribe(render());
+    ).subscribe();
 }
