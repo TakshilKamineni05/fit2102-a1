@@ -31,6 +31,8 @@ import {
     timer,
     tap,
     of,
+    switchScan,
+    last,
 } from "rxjs";
 import { fromFetch } from "rxjs/fetch";
 
@@ -115,6 +117,8 @@ type Pipe = Readonly<{
 }>;
 
 type Bird = Readonly<{ y: number; vy: number }>;
+
+type GhostSample = Readonly<{ t: number; y: number }>;
 
 type State = Readonly<{
     t: number;
