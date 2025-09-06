@@ -33,6 +33,8 @@ import {
     of,
     switchScan,
     last,
+    mergeMap,
+    from,
 } from "rxjs";
 import { fromFetch } from "rxjs/fetch";
 
@@ -130,7 +132,7 @@ type State = Readonly<{
     spawned: number;
     totalToSpawn: number;
     iFramesMs: number; // remaining hit-cooldown ms (invulnerability window)
-
+    paused: boolean; // not implemented
     ghostNow: readonly GhostSample[]; // this run’s recording
     ghostPrev?: readonly GhostSample[]; // previous run’s recording (for playback)
 }>;
@@ -145,7 +147,7 @@ const initialState: State = {
     spawned: 0,
     totalToSpawn: 0,
     iFramesMs: 0,
-
+    paused: false,
     ghostNow: [],
     ghostPrev: undefined,
 };
@@ -154,7 +156,8 @@ const initialState: State = {
 type EvTick = Readonly<{ kind: "tick"; dt: number }>;
 type EvFlap = Readonly<{ kind: "flap"; vy: number }>; // randomised vy from your dot logic
 type EvSpawn = Readonly<{ kind: "spawn"; id: number; spec: PipeSpec }>;
-type Event = EvTick | EvFlap | EvSpawn;
+type EvTogglePause = Readonly<{ kind: "pauseToggle" }>;
+type Event = EvTick | EvFlap | EvSpawn | EvTogglePause;
 
 /**
  * Updates the state by proceeding with one time step.
@@ -400,6 +403,9 @@ const step = (s: State, e: Event): State => {
         case "flap":
             // Randomised jump strength: set vy to provided value
             return { ...s, bird: { ...s.bird, vy: e.vy } };
+
+        case "pauseToggle":
+            return { ...s, paused: !s.paused };
 
         case "tick": {
             const dt = e.dt / 1000;
