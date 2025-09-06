@@ -322,6 +322,26 @@ const render = (): ((s: State) => void) => {
         } else if (overlay) {
             overlay.remove();
         }
+
+        // Paused overlay
+        let pausedLabel = document.querySelector(
+            "#pausedLabel",
+        ) as SVGTextElement | null;
+        if (s.paused && !s.gameEnd) {
+            if (!pausedLabel) {
+                pausedLabel = createSvgElement(svg.namespaceURI, "text", {
+                    id: "pausedLabel",
+                    x: String(Viewport.CANVAS_WIDTH / 2 - 80),
+                    y: String(40),
+                    "font-size": "20",
+                    fill: "yellow",
+                }) as SVGTextElement;
+                pausedLabel.textContent = "Paused — press P";
+                svg.appendChild(pausedLabel);
+            }
+        } else if (pausedLabel) {
+            pausedLabel.remove();
+        }
     };
 };
 
@@ -614,7 +634,12 @@ export const state$ = (
     };
 
     // Reduce all events into State and complete on game end
-    const events$: Observable<Event> = merge(tick$, flap$, spawn$);
+    const events$: Observable<Event> = merge(
+        tick$,
+        flap$,
+        spawn$,
+        pauseToggleEv$,
+    );
     return events$.pipe(
         scan(step, init),
         startWith(init),
