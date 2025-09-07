@@ -16,17 +16,13 @@ import "./style.css";
 
 import {
     Observable,
-    EMPTY,
     catchError,
-    distinctUntilChanged,
     filter,
-    from,
     fromEvent,
     interval,
     last,
     map,
     merge,
-    mergeMap,
     of,
     scan,
     startWith,
@@ -156,6 +152,9 @@ type State = Readonly<{
      */
     ghostNow: readonly GhostSample[];
     ghostPrev?: readonly (readonly GhostSample[])[];
+    /** Spawn schedule (CSV) and pointer to next one to emit — held in the Model (Asteroids style). */
+    specs: readonly PipeSpec[];
+    nextSpecIdx: number;
 }>;
 
 const initialState: State = {
@@ -172,15 +171,16 @@ const initialState: State = {
     rngSeed: (Constants.SEED ^ 0x2c1b3c6d) >>> 0,
     ghostNow: [],
     ghostPrev: undefined,
+    specs: [],
+    nextSpecIdx: 0,
 };
 
 /** ───────────────────────────── Events (Actions) ───────────────────────────── */
 
 type EvTick = Readonly<{ kind: "tick"; dt: number }>;
 type EvFlap = Readonly<{ kind: "flap"; vy: number }>;
-type EvSpawn = Readonly<{ kind: "spawn"; id: number; spec: PipeSpec }>;
 type EvTogglePause = Readonly<{ kind: "pauseToggle" }>;
-type Event = EvTick | EvFlap | EvSpawn | EvTogglePause;
+type Event = EvTick | EvFlap | EvTogglePause;
 
 /**
  * Updates the state by proceeding one time step using a pure reducer.
@@ -189,17 +189,6 @@ type Event = EvTick | EvFlap | EvSpawn | EvTogglePause;
  */
 const step = (s: State, e: Event): State => {
     switch (e.kind) {
-        case "spawn": {
-            const p: Pipe = {
-                id: e.id,
-                x: Viewport.CANVAS_WIDTH + 20,
-                gapY: e.spec.gapY,
-                gapH: e.spec.gapH,
-                passed: false,
-            };
-            return { ...s, pipes: [...s.pipes, p], spawned: s.spawned + 1 };
-        }
-
         case "flap":
             // Randomised (deterministic) jump strength was computed upstream; set vy directly.
             return { ...s, bird: { ...s.bird, vy: e.vy } };
@@ -208,7 +197,29 @@ const step = (s: State, e: Event): State => {
             return { ...s, paused: !s.paused };
 
         case "tick": {
-            const dt = e.dt / 1000;
+            // If paused, freeze everything (including time/spawns/i-frames/ghosts).
+            if (s.paused || s.gameEnd) return s;
+
+            const dtMs = e.dt;
+            const dt = dtMs / 1000;
+
+            // Advance simulated time first (used by spawns & ghost sampling)
+            const tNext = s.t + dtMs;
+
+            // Schedule any CSV spawns whose time <= tNext
+            let idx = s.nextSpecIdx;
+            const newPipes: Pipe[] = [];
+            while (idx < s.specs.length && s.specs[idx].timeMs <= tNext) {
+                const spec = s.specs[idx];
+                newPipes.push({
+                    id: idx,
+                    x: Viewport.CANVAS_WIDTH + 20,
+                    gapY: spec.gapY,
+                    gapH: spec.gapH,
+                    passed: false,
+                });
+                idx++;
+            }
 
             // Physics: integrate vy, clamp y to viewport bounds
             const vyNext = s.bird.vy + Physics.GRAVITY * dt;
@@ -218,10 +229,10 @@ const step = (s: State, e: Event): State => {
             const yClamped = clamp(yRaw, minY, maxY);
 
             // Record a ghost sample for this run
-            const ghostNow = [...s.ghostNow, { t: s.t + e.dt, y: yClamped }];
+            const ghostNow = [...s.ghostNow, { t: tNext, y: yClamped }];
 
             // Move pipes; cull offscreen
-            const moved = s.pipes.map(p => ({
+            const moved = [...s.pipes, ...newPipes].map(p => ({
                 ...p,
                 x: p.x - Physics.PIPE_SPEED * dt,
             }));
@@ -255,13 +266,13 @@ const step = (s: State, e: Event): State => {
             const hit = hitPipe || hitTopEdge || hitBottomEdge;
 
             // Invulnerability countdown
-            const iFramesMs = Math.max(0, s.iFramesMs - e.dt);
+            const nextIFrames = Math.max(0, s.iFramesMs - dtMs);
 
             let lives = s.lives;
             let vyAfter = vyNext;
             let rngSeed = s.rngSeed;
 
-            if (hit && iFramesMs === 0) {
+            if (hit && nextIFrames === 0) {
                 // Lose a life and bounce with deterministic randomised magnitude
                 lives = Math.max(0, s.lives - 1);
 
@@ -274,24 +285,27 @@ const step = (s: State, e: Event): State => {
                 else if (hitBottomEdge || hitBottomPipe) vyAfter = magUp;
             }
 
-            const allSpawned = s.spawned >= s.totalToSpawn;
+            const allSpawned = idx >= s.specs.length;
             const cleared = pipes.length === 0 && allSpawned;
             const gameEnd = lives <= 0 || cleared;
 
             return {
                 ...s,
-                t: s.t + e.dt,
+                t: tNext,
                 bird: { y: yClamped, vy: vyAfter },
                 pipes,
                 score,
                 lives,
                 gameEnd,
                 iFramesMs:
-                    hit && iFramesMs === 0
+                    hit && nextIFrames === 0
                         ? LivesCfg.HIT_COOLDOWN_MS
-                        : iFramesMs,
+                        : nextIFrames,
                 ghostNow,
                 rngSeed,
+                spawned: s.spawned + newPipes.length,
+                totalToSpawn: s.specs.length,
+                nextSpecIdx: idx,
             };
         }
     }
@@ -598,8 +612,8 @@ const parseCsv = (text: string): readonly PipeSpec[] => {
 
 /** ───────────────────────────── state$ (one run) ─────────────────────────────
  * Build a single game run as a stream of State values from inputs & time.
- * - clock: tick$
- * - inputs: space$, pause$, spawn$
+ * - clock: interval ticks (always produced)
+ * - inputs: space$, pause$
  * - pure state: scan(step, initialState)
  * - effects: handled by the top-level subscribe(render)
  */
@@ -618,68 +632,35 @@ export const state$ = (
     const jumpStrength$ = createRngStreamFromSource(space$)(Constants.SEED);
     const flap$: Observable<EvFlap> = jumpStrength$.pipe(
         map(rand => {
-            // Map [-1,1] -> a deterministic vy range (~ -510..-390)
-            const vy = -450 + rand * 60; // gentle variation
+            // Map [-1,1] -> a deterministic vy range (~ -480..-420)
+            const vy = -450 + rand * 30; // gentle variation
             return { kind: "flap", vy } as const;
         }),
     );
 
-    // Pause toggles a flag in the reducer (for overlay), and gates tick$
-    const pauseKey$ = keyDown("KeyP");
-    const pauseToggleEv$ = pauseKey$.pipe(
+    // Pause toggles a flag in the reducer (Asteroids style)
+    const pauseToggleEv$ = keyDown("KeyP").pipe(
         map((): EvTogglePause => ({ kind: "pauseToggle" })),
     );
 
-    const paused$ = pauseKey$.pipe(
-        scan(paused => !paused, false),
-        distinctUntilChanged(),
-        startWith(false),
-    );
-
-    /** Clock: discrete simulation steps that stop while paused. */
-    const tick$: Observable<EvTick> = paused$.pipe(
-        switchMap(p => (p ? EMPTY : interval(Constants.TICK_RATE_MS))),
+    /** Clock: discrete simulation steps (no external pause gating). */
+    const tick$: Observable<EvTick> = interval(Constants.TICK_RATE_MS).pipe(
         map(() => ({ kind: "tick", dt: Constants.TICK_RATE_MS })),
     );
 
-    // Simulated game time (ms) derived from ticks; pauses freeze time.
-    const gameTime$ = tick$.pipe(
-        scan((t, ev) => t + ev.dt, 0),
-        startWith(0),
-    );
-
-    // Spawns are scheduled by csv "timeMs" against the simulated clock.
     const specs = parseCsv(csvContents);
-    const spawn$: Observable<EvSpawn> = gameTime$.pipe(
-        scan(
-            (acc, t) => {
-                const out: EvSpawn[] = [];
-                let i = acc.nextIdx;
-                while (i < specs.length && specs[i].timeMs <= t) {
-                    out.push({ kind: "spawn", id: i, spec: specs[i] });
-                    i++;
-                }
-                return { nextIdx: i, out };
-            },
-            { nextIdx: 0, out: [] as EvSpawn[] },
-        ),
-        mergeMap(s => from(s.out)),
-    );
 
     const init: State = {
         ...initialState,
         totalToSpawn: specs.length,
+        specs,
+        nextSpecIdx: 0,
         ghostNow: [],
         ghostPrev,
     };
 
     // Merge all events and reduce to State. Complete when the game run ends.
-    const events$: Observable<Event> = merge(
-        tick$,
-        flap$,
-        spawn$,
-        pauseToggleEv$,
-    );
+    const events$: Observable<Event> = merge(tick$, flap$, pauseToggleEv$);
     return events$.pipe(
         scan(step, init),
         startWith(init),
@@ -728,7 +709,7 @@ if (typeof window !== "undefined") {
 
     // FRP Core:
     // 1) clock: tick$ inside state$
-    // 2) inputs: space$, pause$, restart$, spawn$
+    // 2) inputs: space$, pause$, restart$
     // 3) pure state: scan(step, initialState)
     // 4) effects: render() called from the single subscription (via tap)
     csv$.pipe(
