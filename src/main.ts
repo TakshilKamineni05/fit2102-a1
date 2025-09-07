@@ -123,6 +123,7 @@ type Bird = Readonly<{ y: number; vy: number }>;
 
 type GhostSample = Readonly<{ t: number; y: number }>;
 
+// NOTE: ghostPrev now stores MANY past runs (each run is an array of samples)
 type State = Readonly<{
     t: number;
     bird: Bird;
@@ -135,7 +136,7 @@ type State = Readonly<{
     iFramesMs: number; // remaining hit-cooldown ms (invulnerability window)
     paused: boolean; // not implemented
     ghostNow: readonly GhostSample[]; // this run’s recording
-    ghostPrev?: readonly GhostSample[]; // previous run’s recording (for playback)
+    ghostPrev?: readonly (readonly GhostSample[])[]; // ALL previous runs
 }>;
 
 const initialState: State = {
@@ -222,21 +223,24 @@ const render = (): ((s: State) => void) => {
         svg.appendChild(birdImg);
     }
 
-    // Create ghost once
-    let ghostImg = document.querySelector("#ghost") as SVGImageElement | null;
-    if (!ghostImg) {
-        ghostImg = createSvgElement(svg.namespaceURI, "image", {
-            id: "ghost",
-            href: "assets/birb.png",
-            opacity: "0.4",
-            x: `${Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2}`,
-            y: `${Viewport.CANVAS_HEIGHT / 2 - Birb.HEIGHT / 2}`,
-            width: `${Birb.WIDTH}`,
-            height: `${Birb.HEIGHT}`,
-            visibility: "hidden",
-        }) as SVGImageElement;
-        svg.appendChild(ghostImg);
-    }
+    // ── Ghost pool (creates on demand) ─────────────────────────────
+    const ghostImgs: SVGImageElement[] = [];
+    const getGhostImg = (i: number) => {
+        while (ghostImgs.length <= i) {
+            const img = createSvgElement(svg.namespaceURI, "image", {
+                href: "assets/birb.png",
+                x: `${Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2}`,
+                y: `${Viewport.CANVAS_HEIGHT / 2 - Birb.HEIGHT / 2}`,
+                width: `${Birb.WIDTH}`,
+                height: `${Birb.HEIGHT}`,
+                opacity: "0.3",
+                visibility: "hidden",
+            }) as SVGImageElement;
+            svg.appendChild(img);
+            ghostImgs.push(img);
+        }
+        return ghostImgs[i];
+    };
 
     // Maintain pipe elements keyed by ID
     const pipeEls = new Map<
@@ -252,14 +256,34 @@ const render = (): ((s: State) => void) => {
         // Update bird Y
         birdImg!.setAttribute("y", String(s.bird.y - Birb.HEIGHT / 2));
 
-        // Ghost playback: show previous run, synced to s.t
-        if (s.ghostPrev && s.ghostPrev.length) {
-            const idx = binarySearchLastLE(s.ghostPrev, s.t, smp => smp.t);
-            const gy = idx >= 0 ? s.ghostPrev[idx].y : s.ghostPrev[0].y;
-            ghostImg!.setAttribute("y", String(gy - Birb.HEIGHT / 2));
-            ghostImg!.setAttribute("visibility", "visible");
-        } else {
-            ghostImg!.setAttribute("visibility", "hidden");
+        // ── Render ALL ghosts, hide each when its trace ends ─────────
+        const runs = s.ghostPrev ?? [];
+        const n = runs.length;
+
+        for (let i = 0; i < n; i++) {
+            const trace = runs[i];
+            const img = getGhostImg(i);
+
+            if (!trace.length) {
+                img.setAttribute("visibility", "hidden");
+                continue;
+            }
+
+            const lastT = trace[trace.length - 1].t;
+            if (s.t <= lastT) {
+                const idx = binarySearchLastLE(trace, s.t, smp => smp.t);
+                const gy = idx >= 0 ? trace[idx].y : trace[0].y;
+                img.setAttribute("y", String(gy - Birb.HEIGHT / 2));
+                const alpha = 0.18 + 0.6 * ((i + 1) / Math.max(1, n)); // older ghosts fainter
+                img.setAttribute("opacity", alpha.toFixed(2));
+                img.setAttribute("visibility", "visible");
+            } else {
+                img.setAttribute("visibility", "hidden");
+            }
+        }
+        // Hide any extra pooled images if ghosts decreased
+        for (let i = runs.length; i < ghostImgs.length; i++) {
+            ghostImgs[i].setAttribute("visibility", "hidden");
         }
 
         // Ensure/render each pipe
@@ -543,7 +567,7 @@ const parseCsv = (text: string): readonly PipeSpec[] => {
 /** ───────────── state$ — build one run from CSV ───────────── */
 export const state$ = (
     csvContents: string,
-    ghostPrev?: readonly GhostSample[],
+    ghostPrev?: readonly (readonly GhostSample[])[],
 ): Observable<State> => {
     // Key stream: Space for flap (prevent page scroll, ignore auto-repeat)
     const key$ = fromEvent<KeyboardEvent>(window, "keydown");
@@ -630,7 +654,7 @@ export const state$ = (
         ...initialState,
         totalToSpawn: specs.length,
         ghostNow: [],
-        ghostPrev: ghostPrev ?? undefined,
+        ghostPrev: ghostPrev ?? undefined, // ALL previous runs
     };
 
     // Reduce all events into State and complete on game end
@@ -688,7 +712,8 @@ if (typeof window !== "undefined") {
 
     // After click: compose a pure chain of runs.
     // Each run emits States (rendered via tap(renderer)), then completes on gameEnd;
-    // we take its final State, extract ghostNow, and feed it as ghostPrev to the next run.
+    // we take its final State, append ghostNow to the list of ALL prior runs,
+    // and pass that list into the next run.
     csv$.pipe(
         switchMap(contents =>
             click$.pipe(
@@ -697,15 +722,21 @@ if (typeof window !== "undefined") {
                         startWith(null),
                         switchScan(
                             (
-                                prevTrace: readonly GhostSample[] | null,
+                                prevTraces: readonly (readonly GhostSample[])[],
                                 _ev: KeyboardEvent | null,
                             ) =>
-                                state$(contents, prevTrace ?? undefined).pipe(
+                                state$(contents, prevTraces).pipe(
                                     tap(renderer),
                                     last(),
-                                    map(s => s.ghostNow),
+                                    map(
+                                        s =>
+                                            [
+                                                ...prevTraces,
+                                                s.ghostNow,
+                                            ] as const,
+                                    ),
                                 ),
-                            null as readonly GhostSample[] | null,
+                            [] as readonly (readonly GhostSample[])[],
                         ),
                     ),
                 ),
