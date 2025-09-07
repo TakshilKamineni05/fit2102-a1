@@ -12,6 +12,22 @@
  * Document your code!
  */
 
+/*
+AI Use Declaration 
+
+I used ChatGPT (GPT-5 Thinking) to review and refine my FRP/RxJS architecture,
+suggest alternative operator choices (e.g., reducer-centric pause, switchScan
+session loop), and help draft the design document, over ~20 iterations.
+
+I modified the outputs by:
+- Rewriting all code into my own implementation and integrating it with my project.
+- Renaming/adding types and comments to match course conventions.
+- Implementing ghosts, pause, and CSV scheduling purely via scan in the reducer.
+- Testing behaviours and tuning constants; removing any generated scaffolding.
+
+I understand the code and can explain it.
+*/
+
 import "./style.css";
 
 import {
