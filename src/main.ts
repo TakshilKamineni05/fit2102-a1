@@ -66,14 +66,15 @@ const LivesCfg = {
 // User input helper types
 type KeyCode = "Space" | "KeyP" | "KeyR";
 
-/** ───────────────────────────── RNG (deterministic) ─────────────────────────────
- * Linear congruential generator (same shape as used in the unit examples),
- * wrapped so we can keep RNG state *inside* the Model.
+/** ───────────────── RNG (deterministic; model-carried seed) ─────────────────
+ * Linear congruential generator (as per unit examples).
+ * All randomness is derived from State.rngSeed inside the reducer (Asteroids style).
  */
 abstract class RNG {
     private static m = 0x80000000; // 2^31
     private static a = 1103515245;
     private static c = 12345;
+
     /** Next seed (pure arithmetic step) */
     static hash(seed: number): number {
         return (RNG.a * seed + RNG.c) % RNG.m;
@@ -92,24 +93,6 @@ const rand01 = (seed: number) => {
 };
 /** Linear interpolation helper. */
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
-
-/** Build a stream of deterministic random numbers driven by another source stream. */
-export function createRngStreamFromSource<T>(source$: Observable<T>) {
-    return function createRngStream(
-        seed: number = Constants.SEED,
-    ): Observable<number> {
-        return source$.pipe(
-            scan(
-                acc => {
-                    const next = RNG.hash(acc.seed);
-                    return { seed: next, value: RNG.scale(next) };
-                },
-                { seed, value: 0 },
-            ),
-            map(s => s.value),
-        );
-    };
-}
 
 /** ───────────────────────────── Game types ───────────────────────────── */
 
@@ -143,7 +126,8 @@ type State = Readonly<{
     totalToSpawn: number;
     iFramesMs: number; // invulnerability window remaining (ms)
     paused: boolean;
-    /** Deterministic RNG seed carried inside the model (no ambient randomness). */
+
+    /** Deterministic RNG seed carried inside the model (single source of randomness). */
     rngSeed: number;
 
     /** Ghosting:
@@ -152,6 +136,7 @@ type State = Readonly<{
      */
     ghostNow: readonly GhostSample[];
     ghostPrev?: readonly (readonly GhostSample[])[];
+
     /** Spawn schedule (CSV) and pointer to next one to emit — held in the Model (Asteroids style). */
     specs: readonly PipeSpec[];
     nextSpecIdx: number;
@@ -178,7 +163,7 @@ const initialState: State = {
 /** ───────────────────────────── Events (Actions) ───────────────────────────── */
 
 type EvTick = Readonly<{ kind: "tick"; dt: number }>;
-type EvFlap = Readonly<{ kind: "flap"; vy: number }>;
+type EvFlap = Readonly<{ kind: "flap" }>; // no payload; vy computed inside reducer from State.rngSeed
 type EvTogglePause = Readonly<{ kind: "pauseToggle" }>;
 type Event = EvTick | EvFlap | EvTogglePause;
 
@@ -189,15 +174,18 @@ type Event = EvTick | EvFlap | EvTogglePause;
  */
 const step = (s: State, e: Event): State => {
     switch (e.kind) {
-        case "flap":
-            // Randomised (deterministic) jump strength was computed upstream; set vy directly.
-            return { ...s, bird: { ...s.bird, vy: e.vy } };
+        case "flap": {
+            // Deterministic "random" flap strength derived from model RNG
+            const { seed, u } = rand01(s.rngSeed);
+            const vy = -450 + u * 60; // ~ -450..-390
+            return { ...s, rngSeed: seed, bird: { ...s.bird, vy } };
+        }
 
         case "pauseToggle":
             return { ...s, paused: !s.paused };
 
         case "tick": {
-            // If paused, freeze everything (including time/spawns/i-frames/ghosts).
+            // If paused or ended, freeze everything (time, spawns, i-frames, ghosts).
             if (s.paused || s.gameEnd) return s;
 
             const dtMs = e.dt;
@@ -250,9 +238,7 @@ const step = (s: State, e: Event): State => {
             });
 
             // Collisions: with pipes (using yClamped) or world edges
-            const firstHitPipe = pipes.find(p =>
-                collides({ y: yClamped, vy: vyNext }, p),
-            );
+            const firstHitPipe = pipes.find(p => collides(yClamped, p));
             const hitPipe = !!firstHitPipe;
 
             const hitTopEdge = yRaw <= minY;
@@ -309,6 +295,10 @@ const step = (s: State, e: Event): State => {
             };
         }
     }
+
+    // Exhaustiveness guard (keeps ADT handling honest)
+    const _exhaustive: never = e;
+    return s;
 };
 
 /** ───────────────────────────── Rendering (View / side-effects) ───────────────────────────── */
@@ -534,13 +524,13 @@ const render = (): ((s: State) => void) => {
 const clamp = (v: number, lo: number, hi: number) =>
     v < lo ? lo : v > hi ? hi : v;
 
-/** AABB overlap check vs. two pipe rectangles. */
-const collides = (bird: Bird, p: Pipe): boolean => {
+/** AABB overlap check vs. two pipe rectangles.  */
+const collides = (birdY: number, p: Pipe): boolean => {
     // Bird rect
     const bx1 = Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2;
     const bx2 = Viewport.CANVAS_WIDTH * 0.3 + Birb.WIDTH / 2;
-    const by1 = bird.y - Birb.HEIGHT / 2;
-    const by2 = bird.y + Birb.HEIGHT / 2;
+    const by1 = birdY - Birb.HEIGHT / 2;
+    const by2 = birdY + Birb.HEIGHT / 2;
 
     // Top pipe rect
     const tx1 = p.x,
@@ -612,7 +602,7 @@ const parseCsv = (text: string): readonly PipeSpec[] => {
 
 /** ───────────────────────────── state$ (one run) ─────────────────────────────
  * Build a single game run as a stream of State values from inputs & time.
- * - clock: interval ticks (always produced)
+ * - clock: interval ticks (always produced; pause handled *inside* the Model)
  * - inputs: space$, pause$
  * - pure state: scan(step, initialState)
  * - effects: handled by the top-level subscribe(render)
@@ -625,27 +615,25 @@ export const state$ = (
     const keyDown = (code: KeyCode) =>
         fromEvent<KeyboardEvent>(window, "keydown").pipe(
             filter(e => e.code === code && !e.repeat),
+            tap(e => {
+                // Input hygiene: prevent page scroll on Space
+                if (code === "Space") e.preventDefault();
+            }),
         );
 
-    // Space → flap (vy computed deterministically from RNG stream)
-    const space$ = keyDown("Space");
-    const jumpStrength$ = createRngStreamFromSource(space$)(Constants.SEED);
-    const flap$: Observable<EvFlap> = jumpStrength$.pipe(
-        map(rand => {
-            // Map [-1,1] -> a deterministic vy range (~ -480..-420)
-            const vy = -450 + rand * 30; // gentle variation
-            return { kind: "flap", vy } as const;
-        }),
+    // Space → flap (no payload; vy computed from RNG in reducer)
+    const flap$: Observable<EvFlap> = keyDown("Space").pipe(
+        map(() => ({ kind: "flap" }) as const),
     );
 
-    // Pause toggles a flag in the reducer (Asteroids style)
+    // Pause toggles a flag *in the reducer* (Asteroids style)
     const pauseToggleEv$ = keyDown("KeyP").pipe(
         map((): EvTogglePause => ({ kind: "pauseToggle" })),
     );
 
     /** Clock: discrete simulation steps (no external pause gating). */
     const tick$: Observable<EvTick> = interval(Constants.TICK_RATE_MS).pipe(
-        map(() => ({ kind: "tick", dt: Constants.TICK_RATE_MS })),
+        map(() => ({ kind: "tick", dt: Constants.TICK_RATE_MS }) as const),
     );
 
     const specs = parseCsv(csvContents);
