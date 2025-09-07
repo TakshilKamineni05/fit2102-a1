@@ -137,6 +137,7 @@ type State = Readonly<{
     paused: boolean; // not implemented
     ghostNow: readonly GhostSample[]; // this run’s recording
     ghostPrev?: readonly (readonly GhostSample[])[]; // ALL previous runs
+    rngSeed: number; // NEW: deterministic seed used for bounce magnitudes
 }>;
 
 const initialState: State = {
@@ -152,6 +153,7 @@ const initialState: State = {
     paused: false,
     ghostNow: [],
     ghostPrev: undefined,
+    rngSeed: 0, // placeholder, real seed set per run in state$ init
 };
 
 /** Events */
@@ -430,6 +432,15 @@ function binarySearchLastLE<T>(
     return ans;
 }
 
+/** Deterministic helpers for bounce magnitudes */
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+
+const nextRand01 = (seed: number): { seed: number; r: number } => {
+    const next = RNG.hash(seed);
+    // RNG.scale(next) is [-1,1] → map to [0,1]
+    return { seed: next, r: (RNG.scale(next) + 1) / 2 };
+};
+
 /** ───────────── Reducer (with lives + ghost recording) ───────────── */
 
 const step = (s: State, e: Event): State => {
@@ -493,10 +504,10 @@ const step = (s: State, e: Event): State => {
             const hitTopEdge = yRaw <= minY;
             const hitBottomEdge = yRaw >= maxY;
 
-            // Pipe half: compare bird centre to the pipe gap centre
-            const hitTopPipe = !!firstHitPipe && s.bird.y <= firstHitPipe.gapY;
+            // Pipe half: compare using yClamped (actual position this tick)
+            const hitTopPipe = !!firstHitPipe && yClamped <= firstHitPipe.gapY;
             const hitBottomPipe =
-                !!firstHitPipe && s.bird.y > firstHitPipe.gapY;
+                !!firstHitPipe && yClamped > firstHitPipe.gapY;
 
             const hit = hitPipe || hitTopEdge || hitBottomEdge;
 
@@ -506,21 +517,22 @@ const step = (s: State, e: Event): State => {
             let lives = s.lives;
             let vyAfter = vyNext;
             let iFramesMs = nextIFrames;
+            let rngSeed = s.rngSeed;
 
             if (hit && nextIFrames === 0) {
                 // lose a life and bounce in the required direction
                 lives = Math.max(0, s.lives - 1);
 
-                // random magnitude helper
-                const rand = (lo: number, hi: number) =>
-                    lo + Math.random() * (hi - lo);
+                // deterministic magnitude from seed
+                const { seed: seed1, r } = nextRand01(rngSeed);
+                rngSeed = seed1;
 
                 if (hitTopEdge || hitTopPipe) {
-                    // spec: “bounce DOWN” on top hits ⇒ positive vy
-                    vyAfter = rand(250, 300);
+                    // spec: “bounce DOWN” ⇒ +ve vy ∈ [250, 300]
+                    vyAfter = lerp(250, 300, r);
                 } else if (hitBottomEdge || hitBottomPipe) {
-                    // spec: “bounce UP” on bottom hits ⇒ negative vy
-                    vyAfter = -rand(300, 500);
+                    // spec: “bounce UP” ⇒ -ve vy ∈ [300, 500]
+                    vyAfter = -lerp(300, 500, r);
                 }
 
                 iFramesMs = LivesCfg.HIT_COOLDOWN_MS;
@@ -540,6 +552,7 @@ const step = (s: State, e: Event): State => {
                 gameEnd,
                 iFramesMs,
                 ghostNow,
+                rngSeed, // keep RNG state updated
             };
         }
     }
@@ -655,6 +668,7 @@ export const state$ = (
         totalToSpawn: specs.length,
         ghostNow: [],
         ghostPrev: ghostPrev ?? undefined, // ALL previous runs
+        rngSeed: (Constants.SEED ^ 0x2c1b3c6d) >>> 0, // NEW: deterministic seed for bounce magnitudes
     };
 
     // Reduce all events into State and complete on game end
