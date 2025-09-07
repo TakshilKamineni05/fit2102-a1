@@ -12,34 +12,33 @@
  * Document your code!
  */
 
-// test commit
 import "./style.css";
 
 import {
     Observable,
+    EMPTY,
     catchError,
+    distinctUntilChanged,
     filter,
+    from,
     fromEvent,
     interval,
+    last,
     map,
     merge,
-    scan,
-    switchMap,
-    take,
-    startWith,
-    takeWhile,
-    timer,
-    tap,
-    of,
-    switchScan,
-    last,
     mergeMap,
-    from,
-    EMPTY,
+    of,
+    scan,
+    startWith,
+    switchMap,
+    switchScan,
+    take,
+    takeWhile,
+    tap,
 } from "rxjs";
 import { fromFetch } from "rxjs/fetch";
 
-/** Constants */
+/** ───────────────────────────── Constants ───────────────────────────── */
 
 const Viewport = {
     CANVAS_WIDTH: 600,
@@ -58,33 +57,47 @@ const Physics = {
 
 const Constants = {
     PIPE_WIDTH: 50,
-    TICK_RATE_MS: 16, // smoother updates (keep name; just tuned)
-    SEED: 1234, // RNG seed
+    TICK_RATE_MS: 16, // simulation step (ms)
+    SEED: 1234, // global RNG seed for determinism
+    MAX_GHOSTS: 20, // keep at most N previous runs
 } as const;
 
 const LivesCfg = {
-    START: 3, // lives at the beginning
-    HIT_COOLDOWN_MS: 500, // grace period after a hit so we don't lose multiple lives at once
-    BOUNCE_VY: -350, // upward bounce after a hit (feels responsive)
+    START: 3,
+    HIT_COOLDOWN_MS: 500,
 } as const;
 
-// User input
-type Key = "Space";
+// User input helper types
+type KeyCode = "Space" | "KeyP" | "KeyR";
 
-/** ───────────── RNG (from your jumping-dot example) ───────────── */
-
+/** ───────────────────────────── RNG (deterministic) ─────────────────────────────
+ * Linear congruential generator (same shape as used in the unit examples),
+ * wrapped so we can keep RNG state *inside* the Model.
+ */
 abstract class RNG {
     private static m = 0x80000000; // 2^31
     private static a = 1103515245;
     private static c = 12345;
-
-    public static hash = (seed: number): number =>
-        (RNG.a * seed + RNG.c) % RNG.m;
-
-    public static scale = (hash: number): number =>
-        (2 * hash) / (RNG.m - 1) - 1; // [-1, 1]
+    /** Next seed (pure arithmetic step) */
+    static hash(seed: number): number {
+        return (RNG.a * seed + RNG.c) % RNG.m;
+    }
+    /** Scale a seed to [-1,1] (pure) */
+    static scale(seed: number): number {
+        return (2 * seed) / (RNG.m - 1) - 1;
+    }
 }
 
+/** Return next seed + a uniform [0,1) pseudo-random number (pure). */
+const rand01 = (seed: number) => {
+    const next = RNG.hash(seed);
+    const u = (RNG.scale(next) + 1) / 2; // [0,1]
+    return { seed: next >>> 0, u };
+};
+/** Linear interpolation helper. */
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+
+/** Build a stream of deterministic random numbers driven by another source stream. */
 export function createRngStreamFromSource<T>(source$: Observable<T>) {
     return function createRngStream(
         seed: number = Constants.SEED,
@@ -92,9 +105,8 @@ export function createRngStreamFromSource<T>(source$: Observable<T>) {
         return source$.pipe(
             scan(
                 acc => {
-                    const nextHash = RNG.hash(acc.seed);
-                    const value = RNG.scale(nextHash);
-                    return { seed: nextHash, value };
+                    const next = RNG.hash(acc.seed);
+                    return { seed: next, value: RNG.scale(next) };
                 },
                 { seed, value: 0 },
             ),
@@ -103,7 +115,7 @@ export function createRngStreamFromSource<T>(source$: Observable<T>) {
     };
 }
 
-/** ───────────── Game types ───────────── */
+/** ───────────────────────────── Game types ───────────────────────────── */
 
 type PipeSpec = Readonly<{
     gapY: number; // px
@@ -123,21 +135,27 @@ type Bird = Readonly<{ y: number; vy: number }>;
 
 type GhostSample = Readonly<{ t: number; y: number }>;
 
-// NOTE: ghostPrev now stores MANY past runs (each run is an array of samples)
+/** Full immutable game state (Model). */
 type State = Readonly<{
-    t: number;
+    t: number; // ms since run start
     bird: Bird;
     pipes: readonly Pipe[];
     score: number;
     lives: number;
-    gameEnd: boolean; // kept from your original type
+    gameEnd: boolean;
     spawned: number;
     totalToSpawn: number;
-    iFramesMs: number; // remaining hit-cooldown ms (invulnerability window)
-    paused: boolean; // not implemented
-    ghostNow: readonly GhostSample[]; // this run’s recording
-    ghostPrev?: readonly (readonly GhostSample[])[]; // ALL previous runs
-    rngSeed: number; // NEW: deterministic seed used for bounce magnitudes
+    iFramesMs: number; // invulnerability window remaining (ms)
+    paused: boolean;
+    /** Deterministic RNG seed carried inside the model (no ambient randomness). */
+    rngSeed: number;
+
+    /** Ghosting:
+     *  - ghostNow: samples recorded during *this* run
+     *  - ghostPrev: ALL previous runs (each a list of samples)
+     */
+    ghostNow: readonly GhostSample[];
+    ghostPrev?: readonly (readonly GhostSample[])[];
 }>;
 
 const initialState: State = {
@@ -151,36 +169,165 @@ const initialState: State = {
     totalToSpawn: 0,
     iFramesMs: 0,
     paused: false,
+    rngSeed: (Constants.SEED ^ 0x2c1b3c6d) >>> 0,
     ghostNow: [],
     ghostPrev: undefined,
-    rngSeed: 0, // placeholder, real seed set per run in state$ init
 };
 
-/** Events */
+/** ───────────────────────────── Events (Actions) ───────────────────────────── */
+
 type EvTick = Readonly<{ kind: "tick"; dt: number }>;
-type EvFlap = Readonly<{ kind: "flap"; vy: number }>; // randomised vy from your dot logic
+type EvFlap = Readonly<{ kind: "flap"; vy: number }>;
 type EvSpawn = Readonly<{ kind: "spawn"; id: number; spec: PipeSpec }>;
 type EvTogglePause = Readonly<{ kind: "pauseToggle" }>;
 type Event = EvTick | EvFlap | EvSpawn | EvTogglePause;
 
 /**
- * Updates the state by proceeding with one time step.
- * (Original placeholder kept for marking)
+ * Updates the state by proceeding one time step using a pure reducer.
+ * No DOM or other effects here; the reducer returns a *new* State.
+ * In MVC terms, this is the Model update function.
  */
-const tick = (s: State) => s;
+const step = (s: State, e: Event): State => {
+    switch (e.kind) {
+        case "spawn": {
+            const p: Pipe = {
+                id: e.id,
+                x: Viewport.CANVAS_WIDTH + 20,
+                gapY: e.spec.gapY,
+                gapH: e.spec.gapH,
+                passed: false,
+            };
+            return { ...s, pipes: [...s.pipes, p], spawned: s.spawned + 1 };
+        }
 
-/** Rendering (side effects) — helpers kept intact */
+        case "flap":
+            // Randomised (deterministic) jump strength was computed upstream; set vy directly.
+            return { ...s, bird: { ...s.bird, vy: e.vy } };
 
+        case "pauseToggle":
+            return { ...s, paused: !s.paused };
+
+        case "tick": {
+            const dt = e.dt / 1000;
+
+            // Physics: integrate vy, clamp y to viewport bounds
+            const vyNext = s.bird.vy + Physics.GRAVITY * dt;
+            const yRaw = s.bird.y + vyNext * dt;
+            const minY = Birb.HEIGHT / 2;
+            const maxY = Viewport.CANVAS_HEIGHT - Birb.HEIGHT / 2;
+            const yClamped = clamp(yRaw, minY, maxY);
+
+            // Record a ghost sample for this run
+            const ghostNow = [...s.ghostNow, { t: s.t + e.dt, y: yClamped }];
+
+            // Move pipes; cull offscreen
+            const moved = s.pipes.map(p => ({
+                ...p,
+                x: p.x - Physics.PIPE_SPEED * dt,
+            }));
+            const visible = moved.filter(p => p.x + Constants.PIPE_WIDTH > 0);
+
+            // Score: increment when passing pipe trailing edge
+            const birdX = Viewport.CANVAS_WIDTH * 0.3;
+            let score = s.score;
+            const pipes = visible.map(p => {
+                if (!p.passed && p.x + Constants.PIPE_WIDTH < birdX) {
+                    score += 1;
+                    return { ...p, passed: true };
+                }
+                return p;
+            });
+
+            // Collisions: with pipes (using yClamped) or world edges
+            const firstHitPipe = pipes.find(p =>
+                collides({ y: yClamped, vy: vyNext }, p),
+            );
+            const hitPipe = !!firstHitPipe;
+
+            const hitTopEdge = yRaw <= minY;
+            const hitBottomEdge = yRaw >= maxY;
+
+            // Determine which side of the gap we hit using yClamped (deterministic)
+            const hitTopPipe = !!firstHitPipe && yClamped <= firstHitPipe.gapY;
+            const hitBottomPipe =
+                !!firstHitPipe && yClamped > firstHitPipe.gapY;
+
+            const hit = hitPipe || hitTopEdge || hitBottomEdge;
+
+            // Invulnerability countdown
+            const iFramesMs = Math.max(0, s.iFramesMs - e.dt);
+
+            let lives = s.lives;
+            let vyAfter = vyNext;
+            let rngSeed = s.rngSeed;
+
+            if (hit && iFramesMs === 0) {
+                // Lose a life and bounce with deterministic randomised magnitude
+                lives = Math.max(0, s.lives - 1);
+
+                const next = rand01(rngSeed);
+                rngSeed = next.seed;
+                const magDown = lerp(250, 300, next.u);
+                const magUp = -lerp(300, 500, next.u);
+
+                if (hitTopEdge || hitTopPipe) vyAfter = magDown;
+                else if (hitBottomEdge || hitBottomPipe) vyAfter = magUp;
+            }
+
+            const allSpawned = s.spawned >= s.totalToSpawn;
+            const cleared = pipes.length === 0 && allSpawned;
+            const gameEnd = lives <= 0 || cleared;
+
+            return {
+                ...s,
+                t: s.t + e.dt,
+                bird: { y: yClamped, vy: vyAfter },
+                pipes,
+                score,
+                lives,
+                gameEnd,
+                iFramesMs:
+                    hit && iFramesMs === 0
+                        ? LivesCfg.HIT_COOLDOWN_MS
+                        : iFramesMs,
+                ghostNow,
+                rngSeed,
+            };
+        }
+    }
+};
+
+/** ───────────────────────────── Rendering (View / side-effects) ───────────────────────────── */
+
+/**
+ * Bring an SVG element to the foreground.
+ * @param elem SVG element to bring to the foreground.
+ */
 const bringToForeground = (elem: SVGElement): void => {
     elem.parentNode?.appendChild(elem);
 };
+/**
+ * Show a SVG element and bring to foreground.
+ * @param elem SVG element to display.
+ */
 const show = (elem: SVGElement): void => {
     elem.setAttribute("visibility", "visible");
     bringToForeground(elem);
 };
+/**
+ * Hide a SVG element.
+ * @param elem SVG element to hide.
+ */
 const hide = (elem: SVGElement): void => {
     elem.setAttribute("visibility", "hidden");
 };
+/**
+ * Create an SVG element with given attributes.
+ * @param namespace SVG namespace URI.
+ * @param name Element name.
+ * @param props Attribute map.
+ * @returns The created SVG element.
+ */
 const createSvgElement = (
     namespace: string | null,
     name: string,
@@ -191,12 +338,18 @@ const createSvgElement = (
     return elem;
 };
 
+/**
+ * Returns a function that renders State to the SVG canvas.
+ * In MVC terms, this is the View update function (the sole impure section).
+ */
 const render = (): ((s: State) => void) => {
-    // Canvas elements
-    const gameOver = document.querySelector("#gameOver") as SVGElement | null;
-    const container = document.querySelector("#main") as HTMLElement | null;
+    const svg = document.querySelector("#svgCanvas") as SVGSVGElement;
+    svg.setAttribute(
+        "viewBox",
+        `0 0 ${Viewport.CANVAS_WIDTH} ${Viewport.CANVAS_HEIGHT}`,
+    );
 
-    // Text fields
+    // Text fields (simple HUD)
     const livesText = document.querySelector(
         "#livesText",
     ) as HTMLElement | null;
@@ -204,14 +357,7 @@ const render = (): ((s: State) => void) => {
         "#scoreText",
     ) as HTMLElement | null;
 
-    const svg = document.querySelector("#svgCanvas") as SVGSVGElement;
-
-    svg.setAttribute(
-        "viewBox",
-        `0 0 ${Viewport.CANVAS_WIDTH} ${Viewport.CANVAS_HEIGHT}`,
-    );
-
-    // Create bird once
+    // Create main bird once
     let birdImg = document.querySelector("#bird") as SVGImageElement | null;
     if (!birdImg) {
         birdImg = createSvgElement(svg.namespaceURI, "image", {
@@ -225,9 +371,9 @@ const render = (): ((s: State) => void) => {
         svg.appendChild(birdImg);
     }
 
-    // ── Ghost pool (creates on demand) ─────────────────────────────
+    // Ghost image pool: created on demand; we will show N previous runs at once.
     const ghostImgs: SVGImageElement[] = [];
-    const getGhostImg = (i: number) => {
+    const ghostAt = (i: number) => {
         while (ghostImgs.length <= i) {
             const img = createSvgElement(svg.namespaceURI, "image", {
                 href: "assets/birb.png",
@@ -244,51 +390,48 @@ const render = (): ((s: State) => void) => {
         return ghostImgs[i];
     };
 
-    // Maintain pipe elements keyed by ID
+    // Maintain pipe element pairs by id
     const pipeEls = new Map<
         number,
         { top: SVGRectElement; bot: SVGRectElement }
     >();
 
     return (s: State) => {
-        // Update HUD
+        // HUD
         if (scoreText) scoreText.textContent = `Score: ${s.score}`;
         if (livesText) livesText.textContent = `Lives: ${s.lives}`;
 
-        // Update bird Y
+        // Bird position
         birdImg!.setAttribute("y", String(s.bird.y - Birb.HEIGHT / 2));
 
-        // ── Render ALL ghosts, hide each when its trace ends ─────────
+        // Render all ghosts; hide each when its trace finishes
         const runs = s.ghostPrev ?? [];
-        const n = runs.length;
-
-        for (let i = 0; i < n; i++) {
+        for (let i = 0; i < runs.length; i++) {
             const trace = runs[i];
-            const img = getGhostImg(i);
-
-            if (!trace.length) {
+            const img = ghostAt(i);
+            if (trace.length === 0) {
                 img.setAttribute("visibility", "hidden");
                 continue;
             }
-
             const lastT = trace[trace.length - 1].t;
             if (s.t <= lastT) {
                 const idx = binarySearchLastLE(trace, s.t, smp => smp.t);
                 const gy = idx >= 0 ? trace[idx].y : trace[0].y;
                 img.setAttribute("y", String(gy - Birb.HEIGHT / 2));
-                const alpha = 0.18 + 0.6 * ((i + 1) / Math.max(1, n)); // older ghosts fainter
+                // Older ghosts are fainter
+                const alpha = 0.18 + 0.6 * ((i + 1) / Math.max(1, runs.length));
                 img.setAttribute("opacity", alpha.toFixed(2));
                 img.setAttribute("visibility", "visible");
             } else {
                 img.setAttribute("visibility", "hidden");
             }
         }
-        // Hide any extra pooled images if ghosts decreased
+        // Hide any unused pooled ghost images
         for (let i = runs.length; i < ghostImgs.length; i++) {
             ghostImgs[i].setAttribute("visibility", "hidden");
         }
 
-        // Ensure/render each pipe
+        // Pipes
         const seen = new Set<number>();
         for (const p of s.pipes) {
             let pair = pipeEls.get(p.id);
@@ -320,7 +463,7 @@ const render = (): ((s: State) => void) => {
 
             seen.add(p.id);
         }
-        // Remove elements for pipes no longer in state
+        // Remove offscreen pipes' elements
         for (const [id, pair] of pipeEls) {
             if (!seen.has(id)) {
                 pair.top.remove();
@@ -329,7 +472,7 @@ const render = (): ((s: State) => void) => {
             }
         }
 
-        // Game over overlay
+        // Game Over overlay
         let overlay = document.querySelector(
             "#gameOver",
         ) as SVGTextElement | null;
@@ -349,7 +492,7 @@ const render = (): ((s: State) => void) => {
             overlay.remove();
         }
 
-        // Paused overlay
+        // Paused overlay (purely a view concern)
         let pausedLabel = document.querySelector(
             "#pausedLabel",
         ) as SVGTextElement | null;
@@ -371,11 +514,13 @@ const render = (): ((s: State) => void) => {
     };
 };
 
-/** ───────────── Pure helpers ───────────── */
+/** ───────────────────────────── Pure helpers ───────────────────────────── */
 
+/** Clamp numeric value to [lo, hi]. */
 const clamp = (v: number, lo: number, hi: number) =>
     v < lo ? lo : v > hi ? hi : v;
 
+/** AABB overlap check vs. two pipe rectangles. */
 const collides = (bird: Bird, p: Pipe): boolean => {
     // Bird rect
     const bx1 = Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2;
@@ -411,6 +556,7 @@ const collides = (bird: Bird, p: Pipe): boolean => {
     );
 };
 
+/** Binary search for the last index with key <= t (for ghost playback). */
 function binarySearchLastLE<T>(
     arr: readonly T[],
     t: number,
@@ -432,141 +578,14 @@ function binarySearchLastLE<T>(
     return ans;
 }
 
-/** Deterministic helpers for bounce magnitudes */
-const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
-
-const nextRand01 = (seed: number): { seed: number; r: number } => {
-    const next = RNG.hash(seed);
-    // RNG.scale(next) is [-1,1] → map to [0,1]
-    return { seed: next, r: (RNG.scale(next) + 1) / 2 };
-};
-
-/** ───────────── Reducer (with lives + ghost recording) ───────────── */
-
-const step = (s: State, e: Event): State => {
-    switch (e.kind) {
-        case "spawn": {
-            const p: Pipe = {
-                id: e.id,
-                x: Viewport.CANVAS_WIDTH + 20,
-                gapY: e.spec.gapY,
-                gapH: e.spec.gapH,
-                passed: false,
-            };
-            return { ...s, pipes: [...s.pipes, p], spawned: s.spawned + 1 };
-        }
-
-        case "flap":
-            // Randomised jump strength: set vy to provided value
-            return { ...s, bird: { ...s.bird, vy: e.vy } };
-
-        case "pauseToggle":
-            return { ...s, paused: !s.paused };
-
-        case "tick": {
-            const dt = e.dt / 1000;
-
-            // Bird physics
-            const vyNext = s.bird.vy + Physics.GRAVITY * dt;
-            const yRaw = s.bird.y + vyNext * dt;
-            const minY = Birb.HEIGHT / 2;
-            const maxY = Viewport.CANVAS_HEIGHT - Birb.HEIGHT / 2;
-            const yClamped = clamp(yRaw, minY, maxY);
-
-            // Record ghost sample for this run (pure append)
-            const ghostNow = [...s.ghostNow, { t: s.t + e.dt, y: yClamped }];
-
-            // Move pipes & cull offscreen
-            const moved = s.pipes.map(p => ({
-                ...p,
-                x: p.x - Physics.PIPE_SPEED * dt,
-            }));
-            const visible = moved.filter(p => p.x + Constants.PIPE_WIDTH > 0);
-
-            // Scoring
-            const birdX = Viewport.CANVAS_WIDTH * 0.3;
-            let score = s.score;
-            const pipes = visible.map(p => {
-                if (!p.passed && p.x + Constants.PIPE_WIDTH < birdX) {
-                    score += 1;
-                    return { ...p, passed: true };
-                }
-                return p;
-            });
-
-            // Collisions (with pipes OR boundaries) + directional bounces
-            const firstHitPipe = pipes.find(p =>
-                collides({ y: yClamped, vy: vyNext }, p),
-            );
-            const hitPipe = !!firstHitPipe;
-
-            // Edge hits
-            const hitTopEdge = yRaw <= minY;
-            const hitBottomEdge = yRaw >= maxY;
-
-            // Pipe half: compare using yClamped (actual position this tick)
-            const hitTopPipe = !!firstHitPipe && yClamped <= firstHitPipe.gapY;
-            const hitBottomPipe =
-                !!firstHitPipe && yClamped > firstHitPipe.gapY;
-
-            const hit = hitPipe || hitTopEdge || hitBottomEdge;
-
-            // Invulnerability countdown
-            const nextIFrames = Math.max(0, s.iFramesMs - e.dt);
-
-            let lives = s.lives;
-            let vyAfter = vyNext;
-            let iFramesMs = nextIFrames;
-            let rngSeed = s.rngSeed;
-
-            if (hit && nextIFrames === 0) {
-                // lose a life and bounce in the required direction
-                lives = Math.max(0, s.lives - 1);
-
-                // deterministic magnitude from seed
-                const { seed: seed1, r } = nextRand01(rngSeed);
-                rngSeed = seed1;
-
-                if (hitTopEdge || hitTopPipe) {
-                    // spec: “bounce DOWN” ⇒ +ve vy ∈ [250, 300]
-                    vyAfter = lerp(250, 300, r);
-                } else if (hitBottomEdge || hitBottomPipe) {
-                    // spec: “bounce UP” ⇒ -ve vy ∈ [300, 500]
-                    vyAfter = -lerp(300, 500, r);
-                }
-
-                iFramesMs = LivesCfg.HIT_COOLDOWN_MS;
-            }
-
-            const allSpawned = s.spawned >= s.totalToSpawn;
-            const cleared = pipes.length === 0 && allSpawned;
-            const gameEnd = lives <= 0 || cleared;
-
-            return {
-                ...s,
-                t: s.t + e.dt,
-                bird: { y: yClamped, vy: vyAfter },
-                pipes,
-                score,
-                lives,
-                gameEnd,
-                iFramesMs,
-                ghostNow,
-                rngSeed, // keep RNG state updated
-            };
-        }
-    }
-};
-
-/** ───────────── CSV parsing ─────────────
- * Expects: gap_y,gap_height,time with gap_* in [0,1] and time in seconds.
+/** ───────────────────────────── CSV parsing ─────────────────────────────
+ * Expects header: gap_y,gap_height,time with gap_* in [0,1] and time in seconds.
  */
 const parseCsv = (text: string): readonly PipeSpec[] => {
     const [header, ...rows] = text.trim().split(/\r?\n/).filter(Boolean);
     const h = header.toLowerCase().replace(/\s/g, "");
     if (!/^gap_y,gap_height,time$/.test(h))
         throw new Error("CSV header must be: gap_y,gap_height,time");
-
     return rows.map(line => {
         const [gy, gh, t] = line.split(",").map(Number);
         return {
@@ -577,76 +596,60 @@ const parseCsv = (text: string): readonly PipeSpec[] => {
     });
 };
 
-/** ───────────── state$ — build one run from CSV ───────────── */
+/** ───────────────────────────── state$ (one run) ─────────────────────────────
+ * Build a single game run as a stream of State values from inputs & time.
+ * - clock: tick$
+ * - inputs: space$, pause$, spawn$
+ * - pure state: scan(step, initialState)
+ * - effects: handled by the top-level subscribe(render)
+ */
 export const state$ = (
     csvContents: string,
     ghostPrev?: readonly (readonly GhostSample[])[],
 ): Observable<State> => {
-    // Key stream: Space for flap (prevent page scroll, ignore auto-repeat)
-    const key$ = fromEvent<KeyboardEvent>(window, "keydown");
-    const fromKey = (keyCode: Key) =>
-        key$.pipe(
-            filter(
-                e =>
-                    !e.repeat &&
-                    (e.code === keyCode ||
-                        (keyCode === "Space" &&
-                            (e.key === " " || e.code === "Space"))),
-            ),
-            tap(e => {
-                if (e.code === "Space" || e.key === " ") e.preventDefault();
-            }),
+    /** Key streams utility: filter to specific key (ignore key auto-repeat). */
+    const keyDown = (code: KeyCode) =>
+        fromEvent<KeyboardEvent>(window, "keydown").pipe(
+            filter(e => e.code === code && !e.repeat),
         );
 
-    // Randomised jump strength from your dot logic
-    const space$ = fromKey("Space");
+    // Space → flap (vy computed deterministically from RNG stream)
+    const space$ = keyDown("Space");
     const jumpStrength$ = createRngStreamFromSource(space$)(Constants.SEED);
     const flap$: Observable<EvFlap> = jumpStrength$.pipe(
         map(rand => {
-            const vy = -450 + rand * 120; // tune as you like
+            // Map [-1,1] -> a deterministic vy range (~ -510..-390)
+            const vy = -450 + rand * 60; // gentle variation
             return { kind: "flap", vy } as const;
         }),
     );
-    // Pause key
-    const pauseKey$ = fromEvent<KeyboardEvent>(window, "keydown").pipe(
-        filter(e => e.code === "KeyP" && !e.repeat),
-    );
 
-    // Event that flips paused in the reducer (so UI can show "Paused")
+    // Pause toggles a flag in the reducer (for overlay), and gates tick$
+    const pauseKey$ = keyDown("KeyP");
     const pauseToggleEv$ = pauseKey$.pipe(
         map((): EvTogglePause => ({ kind: "pauseToggle" })),
     );
 
-    // Boolean pause state stream (outside the reducer) to gate ticks/spawns
     const paused$ = pauseKey$.pipe(
         scan(paused => !paused, false),
+        distinctUntilChanged(),
         startWith(false),
     );
-    /** Determines the rate of time steps */
+
+    /** Clock: discrete simulation steps that stop while paused. */
     const tick$: Observable<EvTick> = paused$.pipe(
-        switchMap(paused =>
-            paused
-                ? EMPTY
-                : interval(Constants.TICK_RATE_MS).pipe(
-                      map(
-                          (): EvTick => ({
-                              kind: "tick",
-                              dt: Constants.TICK_RATE_MS,
-                          }),
-                      ),
-                  ),
-        ),
+        switchMap(p => (p ? EMPTY : interval(Constants.TICK_RATE_MS))),
+        map(() => ({ kind: "tick", dt: Constants.TICK_RATE_MS })),
     );
 
+    // Simulated game time (ms) derived from ticks; pauses freeze time.
     const gameTime$ = tick$.pipe(
-        // accumulate simulated time in ms
         scan((t, ev) => t + ev.dt, 0),
         startWith(0),
     );
 
-    // Parse CSV & schedule pipe spawns
+    // Spawns are scheduled by csv "timeMs" against the simulated clock.
     const specs = parseCsv(csvContents);
-    // specs already sorted by timeMs (they are from the CSV order)
     const spawn$: Observable<EvSpawn> = gameTime$.pipe(
         scan(
             (acc, t) => {
@@ -660,18 +663,17 @@ export const state$ = (
             },
             { nextIdx: 0, out: [] as EvSpawn[] },
         ),
-        mergeMap(s => from(s.out)), // flatten zero-or-more spawns per tick
+        mergeMap(s => from(s.out)),
     );
 
     const init: State = {
         ...initialState,
         totalToSpawn: specs.length,
         ghostNow: [],
-        ghostPrev: ghostPrev ?? undefined, // ALL previous runs
-        rngSeed: (Constants.SEED ^ 0x2c1b3c6d) >>> 0, // NEW: deterministic seed for bounce magnitudes
+        ghostPrev,
     };
 
-    // Reduce all events into State and complete on game end
+    // Merge all events and reduce to State. Complete when the game run ends.
     const events$: Observable<Event> = merge(
         tick$,
         flap$,
@@ -685,70 +687,75 @@ export const state$ = (
     );
 };
 
-// The following simply runs your main function on window load.  Make sure to leave it in place.
-// You should not need to change this, beware if you are.
+/** ───────────────────────────── Program entry point ─────────────────────────────
+ * The following simply runs your main function on window load. Make sure to leave it in place.
+ * You should not need to change this, beware if you are.
+ */
 if (typeof window !== "undefined") {
     const { protocol, hostname, port } = new URL(import.meta.url);
     const baseUrl = `${protocol}//${hostname}${port ? `:${port}` : ""}`;
     const csvUrl = `${baseUrl}/assets/map.csv`;
 
-    // Get the file from URL
+    // Fetch the CSV (with a tiny fallback so the game still runs if fetch fails).
     const csv$ = fromFetch(csvUrl).pipe(
         switchMap(response => {
-            if (response.ok) {
-                return response.text();
-            } else {
-                throw new Error(`Fetch error: ${response.status}`);
-            }
+            if (response.ok) return response.text();
+            throw new Error(`Fetch error: ${response.status}`);
         }),
         catchError(err => {
             console.error("Error fetching the CSV file:", err);
-            // tiny fallback so the game still runs
             return of(
                 "gap_y,gap_height,time\n0.5,0.25,1\n0.6,0.23,3\n0.4,0.22,5",
             );
         }),
     );
 
-    // First click to start (and ensure focus so key events are captured)
+    // Wait for first user click to start (ensures focus for key events).
     const click$ = fromEvent(document.body, "mousedown").pipe(
         take(1),
         tap(() => (document.body as HTMLElement).focus()),
     );
 
-    // Press 'R' to restart
-    const restart$ = fromEvent<KeyboardEvent>(window, "keydown").pipe(
-        filter(e => e.code === "KeyR"),
-    );
+    // 'R' to restart between runs (keeps ghosts).
+    const keyDown = (code: KeyCode) =>
+        fromEvent<KeyboardEvent>(window, "keydown").pipe(
+            filter(e => e.code === code && !e.repeat),
+        );
+    const restart$ = keyDown("KeyR");
 
-    // Build a renderer once; use it inside the run chain
+    // Build a single renderer and use it for all runs.
     const renderer = render();
 
-    // After click: compose a pure chain of runs.
-    // Each run emits States (rendered via tap(renderer)), then completes on gameEnd;
-    // we take its final State, append ghostNow to the list of ALL prior runs,
-    // and pass that list into the next run.
+    // FRP Core:
+    // 1) clock: tick$ inside state$
+    // 2) inputs: space$, pause$, restart$, spawn$
+    // 3) pure state: scan(step, initialState)
+    // 4) effects: render() called from the single subscription (via tap)
     csv$.pipe(
         switchMap(contents =>
             click$.pipe(
                 switchMap(() =>
                     restart$.pipe(
                         startWith(null),
+                        // Each run: stream States (tap to render), then at completion keep its ghost trace.
                         switchScan(
                             (
-                                prevTraces: readonly (readonly GhostSample[])[],
+                                prevRuns: readonly (readonly GhostSample[])[],
                                 _ev: KeyboardEvent | null,
                             ) =>
-                                state$(contents, prevTraces).pipe(
+                                state$(contents, prevRuns).pipe(
                                     tap(renderer),
-                                    last(),
-                                    map(
-                                        s =>
-                                            [
-                                                ...prevTraces,
-                                                s.ghostNow,
-                                            ] as const,
-                                    ),
+                                    last(), // final State of the run
+                                    map(s => {
+                                        const appended = [
+                                            ...prevRuns,
+                                            s.ghostNow,
+                                        ] as const;
+                                        // Bound memory to MAX_GHOSTS most recent runs
+                                        return appended.slice(
+                                            -Constants.MAX_GHOSTS,
+                                        );
+                                    }),
                                 ),
                             [] as readonly (readonly GhostSample[])[],
                         ),
